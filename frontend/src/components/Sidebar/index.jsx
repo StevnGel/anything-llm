@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { List, Plus } from "@phosphor-icons/react";
+import { ChartLineUp, List, Plus } from "@phosphor-icons/react";
 import NewWorkspaceModal, {
   useNewWorkspaceModal,
 } from "../Modals/NewWorkspace";
@@ -8,8 +8,8 @@ import useLogo from "@/hooks/useLogo";
 import useUser from "@/hooks/useUser";
 import Footer from "../Footer";
 import SettingsButton from "../SettingsButton";
-import { Link } from "react-router-dom";
-import paths from "@/utils/paths";
+import { Link, useLocation } from "react-router-dom";
+import paths, { isPathMatch } from "@/utils/paths";
 import { useTranslation } from "react-i18next";
 import { useSidebarToggle, ToggleSidebarButton } from "./SidebarToggle";
 import SearchBox from "./SearchBox";
@@ -17,6 +17,7 @@ import { Tooltip } from "react-tooltip";
 import { createPortal } from "react-dom";
 
 export default function Sidebar() {
+  const { pathname } = useLocation();
   const { user } = useUser();
   const { logo } = useLogo();
   const sidebarRef = useRef(null);
@@ -63,6 +64,14 @@ export default function Sidebar() {
                 <div className="relative h-[calc(100%-60px)] flex flex-col w-full justify-between pt-[10px] overflow-y-scroll no-scroll">
                   <div className="flex flex-col gap-y-[14px]">
                     <SearchBox user={user} showNewWsModal={showNewWsModal} />
+                    <Link
+                      to={paths.ashares.home()}
+                      aria-current={isPathMatch(paths.ashares.home(), pathname) ? "page" : undefined}
+                      className="flex items-center gap-2 px-3 py-2 rounded text-white light:text-slate-800 bg-theme-sidebar-item-default hover:bg-theme-sidebar-item-hover"
+                    >
+                      <ChartLineUp size={19} />
+                      <span className="text-sm font-medium">A 股工作台</span>
+                    </Link>
                     <ActiveWorkspaces />
                   </div>
                 </div>
@@ -81,6 +90,7 @@ export default function Sidebar() {
 }
 
 export function SidebarMobileHeader() {
+  const { pathname } = useLocation();
   const { logo } = useLogo();
   const sidebarRef = useRef(null);
   const [showSidebar, setShowSidebar] = useState(false);
@@ -173,6 +183,15 @@ export function SidebarMobileHeader() {
                     user={user}
                     showNewWsModal={showNewWsModal}
                   />
+                  <Link
+                    to={paths.ashares.home()}
+                    onClick={() => setShowSidebar(false)}
+                    aria-current={isPathMatch(paths.ashares.home(), pathname) ? "page" : undefined}
+                    className="flex items-center gap-2 px-3 py-2 rounded text-white light:text-slate-800 bg-theme-sidebar-item-default"
+                  >
+                    <ChartLineUp size={19} />
+                    <span>A 股工作台</span>
+                  </Link>
                   <ActiveWorkspaces />
                 </div>
               </div>

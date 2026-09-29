@@ -23,6 +23,14 @@ export default {
   home: () => {
     return "/";
   },
+  ashares: {
+    home: () => "/ashares",
+    stock: (symbol) => `/ashares/stocks/${encodeURIComponent(symbol)}`,
+    compare: () => "/ashares/compare",
+    collections: () => "/ashares/collections",
+    data: () => "/ashares/data",
+    dataCenter: () => "/ashares/data-center",
+  },
   login: (noTry = false) => {
     return `/login${noTry ? "?nt=1" : ""}`;
   },

@@ -59,6 +59,51 @@ const router = createBrowserRouter([
         children: [{ path: "t/:threadSlug", element: null }],
       },
       {
+        path: "/ashares",
+        lazy: async () => {
+          const { default: ASharesLayout } = await import("@/pages/AShares/Layout");
+          return { element: <PrivateRoute Component={ASharesLayout} /> };
+        },
+        children: [
+          {
+            index: true,
+            lazy: async () => ({
+              Component: (await import("@/pages/AShares/Workbench")).default,
+            }),
+          },
+          {
+            path: "stocks/:symbol",
+            lazy: async () => ({
+              Component: (await import("@/pages/AShares/StockDetail")).default,
+            }),
+          },
+          {
+            path: "compare",
+            lazy: async () => ({
+              Component: (await import("@/pages/AShares/Compare")).default,
+            }),
+          },
+          {
+            path: "collections",
+            lazy: async () => ({
+              Component: (await import("@/pages/AShares/Collections")).default,
+            }),
+          },
+          {
+            path: "data",
+            lazy: async () => ({
+              Component: (await import("@/pages/AShares/DataBrowser")).default,
+            }),
+          },
+          {
+            path: "data-center",
+            lazy: async () => ({
+              Component: (await import("@/pages/AShares/DataCenter")).default,
+            }),
+          },
+        ],
+      },
+      {
         path: "/accept-invite/:code",
         lazy: async () => {
           const { default: InvitePage } = await import("@/pages/Invite");
