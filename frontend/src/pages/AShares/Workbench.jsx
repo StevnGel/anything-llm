@@ -40,7 +40,7 @@ export default function Workbench() {
   const [tags, setTags] = useState([]);
   const [groups, setGroups] = useState([]);
   const [error, setError] = useState(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(true);
   const [revision, setRevision] = useState(0);
   const [selected, setSelected] = useState([]);
   const [bulkTag, setBulkTag] = useState("");
@@ -176,6 +176,12 @@ export default function Workbench() {
   const current =
     rows?.items?.find((row) => row.symbol === currentSymbol) ||
     rows?.items?.[0];
+  let listSummary = "加载中";
+  if (rows) {
+    listSummary = `${rows.total} 只`;
+  } else if (!busy) {
+    listSummary = error ? "加载失败" : "暂无数据";
+  }
 
   return (
     <>
@@ -329,7 +335,7 @@ export default function Workbench() {
           <div className="ashares-pane-header">
             <strong>股票</strong>
             <span>
-              {rows ? `${rows.total} 只` : "加载中"}
+              {listSummary}
               {busy && rows ? " · 更新中" : ""}
             </span>
           </div>
