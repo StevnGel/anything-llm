@@ -45,9 +45,9 @@ Workspace**。删除 Workspace 不应删除 A 股业务数据。同步任务运�
 | `ashare-service/` | FastAPI、同步任务、行情数据库与业务状态 |
 | `docker/` | AnythingLLM 镜像和整套服务的 Compose 配置 |
 
-本地开发需要 Node.js 18（见 `.nvmrc`）、Yarn 1、Python 3.12、`uv` 和可用的
-`FUYAO_API_KEY`。Docker 部署需要 Docker Engine 与 Compose；建议为全市场回填预留
-额外内存和磁盘空间。本文命令以 Linux、macOS 或 WSL 的 POSIX Shell 为例。
+本地开发需要 Node.js >=18.12.1（`.nvmrc` 固定为 Node.js 18）、Yarn 1、Python 3.12、
+`uv` 和可用的 `FUYAO_API_KEY`。Docker 部署需要 Docker Engine 与 Compose；建议为
+全市场回填预留额外内存和磁盘空间。本文命令以 Linux、macOS 或 WSL 的 POSIX Shell 为例。
 
 ### 关键配置
 
@@ -69,16 +69,37 @@ Workspace**。删除 Workspace 不应删除 A 股业务数据。同步任务运�
 以下命令从仓库根目录执行。首次安装依赖并准备 AnythingLLM 数据库：
 
 ```bash
-corepack enable
+mkdir -p "$HOME/.local/bin"
+corepack enable --install-directory "$HOME/.local/bin"
+corepack install --global yarn@1.22.22
+export PATH="$HOME/.local/bin:$PATH"
+# 启动和安装依赖时不让 Corepack 自动改写 package.json。
+export COREPACK_ENABLE_AUTO_PIN=0
 yarn setup
 uv venv --python 3.12 ashare-service/.venv
 uv pip install --python ashare-service/.venv/bin/python -r ashare-service/requirements.txt
 cp -n ashare-service/.env.example ashare-service/.env
+cp -n collector/.env.example collector/.env.development
 ```
 
 `yarn setup` 会安装三部分 JavaScript 依赖、生成 Prisma Client、迁移数据库，并创建
-`server/.env.development`、`frontend/.env` 和 `collector/.env`。检查
-`frontend/.env` 中的 `VITE_API_BASE=/api`。已有数据的环境应先备份，再执行迁移。
+`server/.env.development`、`frontend/.env` 和 `collector/.env`。Collector 的开发模式
+实际读取 `collector/.env.development`，需按上面的命令另行创建。已有数据的环境应先
+备份，再执行迁移。
+
+已有依赖时只需补齐缺失配置，不必重新运行 `yarn setup` 或迁移数据库：
+
+```bash
+cp -n server/.env.example server/.env.development
+cp -n frontend/.env.example frontend/.env
+cp -n collector/.env.example collector/.env.development
+cp -n ashare-service/.env.example ashare-service/.env
+```
+
+`server/.env.development` 就在仓库的 `server/` 目录中；`NODE_ENV=development` 时
+不会自动加载 `server/.env`。检查 `frontend/.env` 中的 `VITE_API_BASE=/api`。
+首次配置应替换主服务示例中的 `JWT_SECRET`、`SIG_KEY` 和 `SIG_SALT`；已有业务数据时，
+沿用现有的 `SIG_KEY`、`SIG_SALT`，避免无法解密已保存的数据。
 
 填写 `ashare-service/.env` 中的 `FUYAO_API_KEY` 和 `ASHARE_SERVICE_TOKEN`；在
 `server/.env.development` 中设置**相同**的 `ASHARE_SERVICE_TOKEN`，并设置：
@@ -88,7 +109,11 @@ SERVER_HOST=127.0.0.1
 ASHARE_SERVICE_URL=http://127.0.0.1:8765
 ```
 
-配置文件中的凭据值必须由部署者填写；示例文件不能直接用于生产。分别打开四个终端：
+配置文件中的凭据值必须由部署者填写；示例文件不能直接用于生产。
+
+### 前台启动
+
+分别打开四个终端；四个命令均以仓库根目录为起点：
 
 ```bash
 # 终端 1：A 股 API；.env 中的值按 Shell 语法填写，特殊字符需加引号。
@@ -111,6 +136,80 @@ yarn dev:frontend
 打开 `http://127.0.0.1:3000/ashares`。Vite 在 3000 端口将 `/api` 转发到 Express
 的 3001 端口；浏览器不需要直接访问 3001 或 8765。首次进入数据中心，先更新股票池，
 再同步最近交易日；按需要运行近五年全量回填或指定股票的历史补数。
+
+前台方式在各自终端按 `Ctrl+C` 停止服务。
+
+### 后台启动与停止
+
+以下是本地后台启动使用的命令，适用于安装了 `nohup`、`setsid` 的 Linux/WSL。
+先停止已经运行的同名服务，再从仓库根目录执行；四项服务分别使用独立进程组。
+
+```bash
+bash <<'BASH'
+set -euo pipefail
+
+# 日志可能包含调试配置，仅供当前用户读取。
+umask 077
+mkdir -p tmp/local-dev
+export COREPACK_ENABLE_AUTO_PIN=0
+
+# A 股凭据只在其子进程内加载，不传给 Express、Collector 或 Vite。
+nohup setsid bash -c '
+  cd ashare-service
+  set -a
+  . ./.env
+  set +a
+  exec .venv/bin/python -m uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8765
+' >tmp/local-dev/ashare.log 2>&1 </dev/null &
+printf '%s\n' "$!" >tmp/local-dev/ashare.pid
+
+nohup setsid yarn dev:server \
+  >tmp/local-dev/server.log 2>&1 </dev/null &
+printf '%s\n' "$!" >tmp/local-dev/server.pid
+
+nohup setsid yarn dev:collector \
+  >tmp/local-dev/collector.log 2>&1 </dev/null &
+printf '%s\n' "$!" >tmp/local-dev/collector.pid
+
+nohup setsid yarn dev:frontend \
+  >tmp/local-dev/frontend.log 2>&1 </dev/null &
+printf '%s\n' "$!" >tmp/local-dev/frontend.pid
+BASH
+```
+
+这里用非交互式 Bash 启动，避免终端的作业控制让 `setsid` 再次 fork，
+从而导致 `$!` 与实际进程组 ID 不一致。
+`tmp/local-dev/*.log` 是运行日志，`*.pid` 记录本次启动的进程组 ID。
+服务运行期间保留该目录；不要重复启动或复用历史 PID 文件。
+启动后验证页面与接口：
+
+```bash
+curl --noproxy '*' --fail http://127.0.0.1:8765/health
+curl --noproxy '*' --fail http://127.0.0.1:3000/api/ping
+curl --noproxy '*' --fail http://127.0.0.1:3000/api/ashares/capabilities
+```
+
+停止前先查看记录的进程，核对命令和启动时间。以下 `kill` 向整个进程组发送 `SIGTERM`，
+使 Yarn、nodemon 和实际服务进程一起退出；不会删除业务数据库：
+
+```bash
+read -r frontend_pid < tmp/local-dev/frontend.pid
+read -r collector_pid < tmp/local-dev/collector.pid
+read -r server_pid < tmp/local-dev/server.pid
+read -r ashare_pid < tmp/local-dev/ashare.pid
+
+ps -o pid,pgid,lstart,args -p "$frontend_pid,$collector_pid,$server_pid,$ashare_pid"
+
+kill -TERM -- "-$frontend_pid"
+kill -TERM -- "-$collector_pid"
+kill -TERM -- "-$server_pid"
+kill -TERM -- "-$ashare_pid"
+```
+
+全部停止并确认日志不再需要后，才清理 `tmp/local-dev/`。下次启动会更新 PID 文件，
+日志采用追加写入。
 
 ### 非容器生产部署
 
