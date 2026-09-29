@@ -30,8 +30,14 @@ export default function KlineChart({ bars = [], height = 360 }) {
       width: container.clientWidth,
       height,
       layout: {
-        background: { color: getComputedStyle(container).getPropertyValue("--ashares-chart-bg").trim() },
-        textColor: getComputedStyle(container).getPropertyValue("--ashares-muted").trim(),
+        background: {
+          color: getComputedStyle(container)
+            .getPropertyValue("--ashares-chart-bg")
+            .trim(),
+        },
+        textColor: getComputedStyle(container)
+          .getPropertyValue("--ashares-muted")
+          .trim(),
         fontFamily: "inherit",
         fontSize: 11,
       },
@@ -39,9 +45,15 @@ export default function KlineChart({ bars = [], height = 360 }) {
         vertLines: { color: "rgba(128, 142, 145, 0.08)" },
         horzLines: { color: "rgba(128, 142, 145, 0.1)" },
       },
-      rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.08, bottom: 0.24 } },
+      rightPriceScale: {
+        borderVisible: false,
+        scaleMargins: { top: 0.08, bottom: 0.24 },
+      },
       timeScale: { borderVisible: false, timeVisible: false, rightOffset: 3 },
-      crosshair: { vertLine: { labelVisible: true }, horzLine: { labelVisible: true } },
+      crosshair: {
+        vertLine: { labelVisible: true },
+        horzLine: { labelVisible: true },
+      },
     });
     const candle = chart.addCandlestickSeries({
       upColor: "#d45659",
@@ -55,7 +67,9 @@ export default function KlineChart({ bars = [], height = 360 }) {
       priceFormat: { type: "volume" },
       priceScaleId: "",
     });
-    volume.priceScale().applyOptions({ scaleMargins: { top: 0.79, bottom: 0 } });
+    volume
+      .priceScale()
+      .applyOptions({ scaleMargins: { top: 0.79, bottom: 0 } });
     const average = chart.addLineSeries({
       color: "#d2ab57",
       lineWidth: 1,
@@ -98,7 +112,10 @@ export default function KlineChart({ bars = [], height = 360 }) {
       bars.map((bar) => ({
         time: bar.date,
         value: bar.volume || 0,
-        color: bar.close >= bar.open ? "rgba(212, 86, 89, 0.42)" : "rgba(36, 146, 115, 0.42)",
+        color:
+          bar.close >= bar.open
+            ? "rgba(212, 86, 89, 0.42)"
+            : "rgba(36, 146, 115, 0.42)",
       }))
     );
     averageRef.current.setData(movingAverage(bars, 20));

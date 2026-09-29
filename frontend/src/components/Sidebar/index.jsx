@@ -66,7 +66,11 @@ export default function Sidebar() {
                     <SearchBox user={user} showNewWsModal={showNewWsModal} />
                     <Link
                       to={paths.ashares.home()}
-                      aria-current={isPathMatch(paths.ashares.home(), pathname) ? "page" : undefined}
+                      aria-current={
+                        isPathMatch(paths.ashares.home(), pathname)
+                          ? "page"
+                          : undefined
+                      }
                       className="flex items-center gap-2 px-3 py-2 rounded text-white light:text-slate-800 bg-theme-sidebar-item-default hover:bg-theme-sidebar-item-hover"
                     >
                       <ChartLineUp size={19} />
@@ -186,7 +190,11 @@ export function SidebarMobileHeader() {
                   <Link
                     to={paths.ashares.home()}
                     onClick={() => setShowSidebar(false)}
-                    aria-current={isPathMatch(paths.ashares.home(), pathname) ? "page" : undefined}
+                    aria-current={
+                      isPathMatch(paths.ashares.home(), pathname)
+                        ? "page"
+                        : undefined
+                    }
                     className="flex items-center gap-2 px-3 py-2 rounded text-white light:text-slate-800 bg-theme-sidebar-item-default"
                   >
                     <ChartLineUp size={19} />

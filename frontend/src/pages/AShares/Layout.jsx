@@ -1,4 +1,10 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import Sidebar, { SidebarMobileHeader } from "@/components/Sidebar";
 import PasswordModal, { usePasswordModal } from "@/components/Modals/Password";
@@ -21,7 +27,9 @@ const NAVIGATION = [
 ];
 
 function useNarrowViewport() {
-  const [narrow, setNarrow] = useState(() => window.matchMedia("(max-width: 900px)").matches);
+  const [narrow, setNarrow] = useState(
+    () => window.matchMedia("(max-width: 900px)").matches
+  );
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 900px)");
@@ -59,7 +67,9 @@ export default function ASharesLayout() {
                   key={item.to}
                   to={item.to}
                   end={item.end}
-                  className={({ isActive }) => `ashares-nav-link${isActive ? " active" : ""}`}
+                  className={({ isActive }) =>
+                    `ashares-nav-link${isActive ? " active" : ""}`
+                  }
                 >
                   {item.label}
                 </NavLink>

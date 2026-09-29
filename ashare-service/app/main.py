@@ -6,17 +6,18 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import date
+from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from .db import Base, SessionLocal, engine
 from .models import (
+    ComparisonSet,
     DailyBar,
-    Security,
     SecurityNote,
     SecurityTag,
     StockGroup,
@@ -39,11 +40,20 @@ from .service import (
 )
 
 HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+Name80 = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)
+]
+Name100 = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)
+]
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     Base.metadata.create_all(engine)
+    # create_all 不会为既有表补建索引；日期查询与标签去重都依赖它们。
+    for index in DailyBar.__table__.indexes | Tag.__table__.indexes:
+        index.create(engine, checkfirst=True)
     # 进程中断后线程任务不会继续运行；保留记录并明确标记失败，允许重新提交。
     with SessionLocal.begin() as session:
         jobs = session.scalars(
@@ -56,7 +66,9 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="AnythingLLM A 股服务", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(
+    title="AnythingLLM A 股服务", lifespan=lifespan, docs_url=None, redoc_url=None
+)
 
 
 @app.middleware("http")
@@ -85,7 +97,7 @@ def capabilities():
         "boards": ["SSE_MAIN", "SZSE_MAIN", "CHINEXT", "STAR"],
         "provider": "Fuyao",
         "provider_configured": bool(os.getenv("FUYAO_API_KEY")),
-        "sync_modes": ["universe", "recent", "history"],
+        "sync_modes": ["universe", "recent", "full", "history"],
     }
 
 
@@ -131,7 +143,9 @@ def security_detail(symbol: str):
                 "content": note.content,
                 "version": note.version,
                 "updated_at": note.updated_at.isoformat(),
-            } if note else {"content": "", "version": 0, "updated_at": None},
+            }
+            if note
+            else {"content": "", "version": 0, "updated_at": None},
         }
 
 
@@ -172,23 +186,47 @@ def bars_batch(body: BatchBarsBody):
 
 @app.post("/comparisons/query")
 def comparisons_query(body: BatchBarsBody):
+    if len(body.symbols) < 2:
+        raise HTTPException(status_code=422, detail="比较至少需要两只股票")
     batch = bars_batch(body)["results"]
+    available = [result["bars"] for result in batch.values() if result.get("bars")]
+    common_dates = (
+        set.intersection(*[{bar["date"] for bar in bars} for bars in available])
+        if available
+        else set()
+    )
+    base_date = min(common_dates) if common_dates else None
     timeline = set()
-    for result in batch.values():
-        timeline.update(bar["date"] for bar in result.get("bars", []))
     series = {}
     for symbol, result in batch.items():
         bars = result.get("bars", [])
-        first_close = bars[0]["close"] if bars else None
+        base_bar = next((bar for bar in bars if bar["date"] == base_date), None)
+        base_close = base_bar["close"] if base_bar else None
+        points = [bar for bar in bars if base_date and bar["date"] >= base_date]
+        timeline.update(bar["date"] for bar in points)
         series[symbol] = {
             "name": result.get("security", {}).get("name", symbol),
             "points": [
-                {"date": bar["date"], "value": round(bar["close"] / first_close * 100, 3)}
-                for bar in bars
-            ] if first_close else [],
-            "error": result.get("error"),
+                {
+                    "date": bar["date"],
+                    "value": round(bar["close"] / base_close * 100, 3),
+                }
+                for bar in points
+            ]
+            if base_close
+            else [],
+            "error": result.get("error")
+            or ("所选范围内没有共同交易日" if bars and not base_date else None),
         }
-    return {"dates": sorted(timeline), "series": series, "base": 100}
+    return {
+        "dates": sorted(timeline),
+        "series": series,
+        "base": 100,
+        "base_date": base_date,
+        "error": "所选股票在该日期范围内没有共同交易日"
+        if available and not base_date
+        else None,
+    }
 
 
 @app.get("/watchlists/default")
@@ -227,7 +265,9 @@ def update_note(symbol: str, body: NoteBody):
         note = session.get(SecurityNote, symbol)
         actual_version = note.version if note else 0
         if body.version != actual_version:
-            raise HTTPException(status_code=409, detail="备注已被其他人修改，请刷新后重试")
+            raise HTTPException(
+                status_code=409, detail="备注已被其他人修改，请刷新后重试"
+            )
         if note is None:
             note = SecurityNote(symbol=symbol, content=body.content)
             session.add(note)
@@ -263,7 +303,7 @@ def tag_categories():
 
 
 class CategoryBody(BaseModel):
-    name: str = Field(min_length=1, max_length=80)
+    name: Name80
 
 
 @app.post("/tag-categories", status_code=201)
@@ -278,13 +318,29 @@ def create_category(body: CategoryBody):
         raise HTTPException(status_code=409, detail="标签分类名称已存在") from exc
 
 
+@app.patch("/tag-categories/{category_id}")
+def update_category(category_id: int, body: CategoryBody):
+    try:
+        with SessionLocal.begin() as session:
+            category = session.get(TagCategory, category_id)
+            if category is None:
+                raise HTTPException(status_code=404, detail="标签分类不存在")
+            category.name = body.name.strip()
+            session.flush()
+            return {"id": category.id, "name": category.name}
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="标签分类名称已存在") from exc
+
+
 @app.delete("/tag-categories/{category_id}")
 def delete_category(category_id: int):
     with SessionLocal.begin() as session:
         category = session.get(TagCategory, category_id)
         if category is None:
             raise HTTPException(status_code=404, detail="标签分类不存在")
-        used = session.scalar(select(func.count()).select_from(Tag).where(Tag.category_id == category_id))
+        used = session.scalar(
+            select(func.count()).select_from(Tag).where(Tag.category_id == category_id)
+        )
         if used:
             raise HTTPException(status_code=409, detail="分类下仍有标签，请先处理标签")
         session.delete(category)
@@ -294,12 +350,17 @@ def delete_category(category_id: int):
 @app.get("/tags")
 def tags():
     with SessionLocal() as session:
-        return {"items": [_tag_payload(tag) for tag in session.scalars(select(Tag).order_by(Tag.id))]}
+        return {
+            "items": [
+                _tag_payload(tag)
+                for tag in session.scalars(select(Tag).order_by(Tag.id))
+            ]
+        }
 
 
 class TagBody(BaseModel):
     category_id: int
-    name: str = Field(min_length=1, max_length=80)
+    name: Name80
     color: str = "#4f8071"
 
 
@@ -307,18 +368,25 @@ class TagBody(BaseModel):
 def create_tag(body: TagBody):
     if not HEX_COLOR.fullmatch(body.color):
         raise HTTPException(status_code=422, detail="颜色必须是六位十六进制值")
-    with SessionLocal.begin() as session:
-        if not session.get(TagCategory, body.category_id):
-            raise HTTPException(status_code=404, detail="标签分类不存在")
-        exists = session.scalars(
-            select(Tag).where(Tag.category_id == body.category_id, Tag.name == body.name.strip())
-        ).first()
-        if exists:
-            raise HTTPException(status_code=409, detail="该分类下标签名称已存在")
-        tag = Tag(category_id=body.category_id, name=body.name.strip(), color=body.color)
-        session.add(tag)
-        session.flush()
-        return _tag_payload(tag)
+    try:
+        with SessionLocal.begin() as session:
+            if not session.get(TagCategory, body.category_id):
+                raise HTTPException(status_code=404, detail="标签分类不存在")
+            exists = session.scalars(
+                select(Tag).where(Tag.name == body.name.strip())
+            ).first()
+            if exists:
+                raise HTTPException(status_code=409, detail="标签名称已存在")
+            tag = Tag(
+                category_id=body.category_id,
+                name=body.name.strip(),
+                color=body.color,
+            )
+            session.add(tag)
+            session.flush()
+            return _tag_payload(tag)
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="标签名称已存在") from exc
 
 
 class TagUpdateBody(TagBody):
@@ -329,19 +397,28 @@ class TagUpdateBody(TagBody):
 def update_tag(tag_id: int, body: TagUpdateBody):
     if not HEX_COLOR.fullmatch(body.color):
         raise HTTPException(status_code=422, detail="颜色必须是六位十六进制值")
-    with SessionLocal.begin() as session:
-        tag = session.get(Tag, tag_id)
-        if tag is None:
-            raise HTTPException(status_code=404, detail="标签不存在")
-        if tag.version != body.version:
-            raise HTTPException(status_code=409, detail="标签已更新，请刷新后重试")
-        if not session.get(TagCategory, body.category_id):
-            raise HTTPException(status_code=404, detail="标签分类不存在")
-        tag.category_id = body.category_id
-        tag.name = body.name.strip()
-        tag.color = body.color
-        tag.version += 1
-        return _tag_payload(tag)
+    try:
+        with SessionLocal.begin() as session:
+            tag = session.get(Tag, tag_id)
+            if tag is None:
+                raise HTTPException(status_code=404, detail="标签不存在")
+            if tag.version != body.version:
+                raise HTTPException(status_code=409, detail="标签已更新，请刷新后重试")
+            if not session.get(TagCategory, body.category_id):
+                raise HTTPException(status_code=404, detail="标签分类不存在")
+            duplicate = session.scalars(
+                select(Tag).where(Tag.name == body.name.strip(), Tag.id != tag_id)
+            ).first()
+            if duplicate:
+                raise HTTPException(status_code=409, detail="标签名称已存在")
+            tag.category_id = body.category_id
+            tag.name = body.name.strip()
+            tag.color = body.color
+            tag.version += 1
+            session.flush()
+            return _tag_payload(tag)
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="标签名称已存在") from exc
 
 
 @app.delete("/tags/{tag_id}")
@@ -350,7 +427,21 @@ def delete_tag(tag_id: int):
         tag = session.get(Tag, tag_id)
         if tag is None:
             raise HTTPException(status_code=404, detail="标签不存在")
-        for link in session.scalars(select(SecurityTag).where(SecurityTag.tag_id == tag_id)):
+        # 动态分组按标签 ID 求值；删除后不能让条件悄悄退化为全市场。
+        for group in session.scalars(
+            select(StockGroup).where(StockGroup.kind == "dynamic")
+        ):
+            definition = json.loads(group.filter_json or "{}")
+            referenced = set(definition.get("include_tag_ids") or [])
+            referenced.update(definition.get("exclude_tag_ids") or [])
+            if tag_id in referenced:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"标签被动态分组「{group.name}」引用，请先调整分组",
+                )
+        for link in session.scalars(
+            select(SecurityTag).where(SecurityTag.tag_id == tag_id)
+        ):
             session.delete(link)
         session.delete(tag)
     return {"success": True}
@@ -400,11 +491,16 @@ def _group_payload(session, group: StockGroup) -> dict:
 @app.get("/groups")
 def groups():
     with SessionLocal() as session:
-        return {"items": [_group_payload(session, group) for group in session.scalars(select(StockGroup).order_by(StockGroup.id))]}
+        return {
+            "items": [
+                _group_payload(session, group)
+                for group in session.scalars(select(StockGroup).order_by(StockGroup.id))
+            ]
+        }
 
 
 class GroupBody(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    name: Name100
     kind: str = "fixed"
     symbols: list[str] = Field(default_factory=list)
     filter: dict | None = None
@@ -418,6 +514,25 @@ def create_group(body: GroupBody):
         raise HTTPException(status_code=422, detail="动态分组需要筛选条件")
     try:
         with SessionLocal.begin() as session:
+            if body.kind == "dynamic":
+                definition = body.filter or {}
+                if (
+                    not any(
+                        definition.get(key)
+                        for key in ("q", "board", "include_tag_ids", "exclude_tag_ids")
+                    )
+                    and definition.get("scope") != "watchlist"
+                ):
+                    raise HTTPException(
+                        status_code=422, detail="动态分组至少需要一个有效条件"
+                    )
+                referenced = set(definition.get("include_tag_ids") or [])
+                referenced.update(definition.get("exclude_tag_ids") or [])
+                for tag_id in referenced:
+                    if not session.get(Tag, tag_id):
+                        raise HTTPException(
+                            status_code=422, detail=f"标签 {tag_id} 不存在"
+                        )
             for symbol in set(body.symbols):
                 require_security(session, symbol)
             group = StockGroup(
@@ -438,6 +553,29 @@ def create_group(body: GroupBody):
 
 class GroupMembersBody(BaseModel):
     symbols: list[str] = Field(max_length=100)
+    version: int = Field(ge=1)
+
+
+class GroupNameBody(BaseModel):
+    name: Name100
+    version: int = Field(ge=1)
+
+
+@app.patch("/groups/{group_id}")
+def rename_group(group_id: int, body: GroupNameBody):
+    try:
+        with SessionLocal.begin() as session:
+            group = session.get(StockGroup, group_id)
+            if group is None:
+                raise HTTPException(status_code=404, detail="分组不存在")
+            if group.version != body.version:
+                raise HTTPException(status_code=409, detail="分组已更新，请刷新后重试")
+            group.name = body.name.strip()
+            group.version += 1
+            session.flush()
+            return _group_payload(session, group)
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="分组名称已存在") from exc
 
 
 @app.put("/groups/{group_id}/members")
@@ -448,6 +586,8 @@ def set_group_members(group_id: int, body: GroupMembersBody):
             raise HTTPException(status_code=404, detail="分组不存在")
         if group.kind != "fixed":
             raise HTTPException(status_code=422, detail="动态分组成员由筛选条件决定")
+        if group.version != body.version:
+            raise HTTPException(status_code=409, detail="分组已更新，请刷新后重试")
         for symbol in set(body.symbols):
             require_security(session, symbol)
         old_items = session.scalars(
@@ -474,6 +614,107 @@ def delete_group(group_id: int):
         ):
             session.delete(item)
         session.delete(group)
+    return {"success": True}
+
+
+def _comparison_payload(comparison: ComparisonSet) -> dict:
+    return {
+        "id": comparison.id,
+        "name": comparison.name,
+        "symbols": json.loads(comparison.symbols_json),
+        "period": comparison.period,
+        "mode": comparison.mode,
+        "start": comparison.start.isoformat() if comparison.start else None,
+        "end": comparison.end.isoformat() if comparison.end else None,
+        "version": comparison.version,
+    }
+
+
+class ComparisonBody(BaseModel):
+    name: Name100
+    symbols: list[str] = Field(min_length=2, max_length=6)
+    period: str = "1d"
+    mode: str = "trend"
+    start: date | None = None
+    end: date | None = None
+
+
+class ComparisonUpdateBody(ComparisonBody):
+    version: int = Field(ge=1)
+
+
+def _validate_comparison(session, body: ComparisonBody):
+    if len(set(body.symbols)) != len(body.symbols):
+        raise HTTPException(status_code=422, detail="比较股票不能重复")
+    if body.period not in {"1d", "1w", "1M"} or body.mode not in {"trend", "grid"}:
+        raise HTTPException(status_code=422, detail="不支持的比较配置")
+    if body.start and body.end and body.start > body.end:
+        raise HTTPException(status_code=422, detail="起始日期不能晚于结束日期")
+    for symbol in body.symbols:
+        require_security(session, symbol)
+
+
+@app.get("/comparison-sets")
+def comparison_sets():
+    with SessionLocal() as session:
+        comparisons = session.scalars(
+            select(ComparisonSet).order_by(ComparisonSet.id)
+        ).all()
+        return {"items": [_comparison_payload(item) for item in comparisons]}
+
+
+@app.post("/comparison-sets", status_code=201)
+def create_comparison(body: ComparisonBody):
+    try:
+        with SessionLocal.begin() as session:
+            _validate_comparison(session, body)
+            comparison = ComparisonSet(
+                name=body.name.strip(),
+                symbols_json=json.dumps(body.symbols),
+                period=body.period,
+                mode=body.mode,
+                start=body.start,
+                end=body.end,
+            )
+            session.add(comparison)
+            session.flush()
+            return _comparison_payload(comparison)
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="比较组合名称已存在") from exc
+
+
+@app.patch("/comparison-sets/{comparison_id}")
+def update_comparison(comparison_id: int, body: ComparisonUpdateBody):
+    try:
+        with SessionLocal.begin() as session:
+            comparison = session.get(ComparisonSet, comparison_id)
+            if comparison is None:
+                raise HTTPException(status_code=404, detail="比较组合不存在")
+            if comparison.version != body.version:
+                raise HTTPException(
+                    status_code=409, detail="比较组合已更新，请刷新后重试"
+                )
+            _validate_comparison(session, body)
+            comparison.name = body.name.strip()
+            comparison.symbols_json = json.dumps(body.symbols)
+            comparison.period = body.period
+            comparison.mode = body.mode
+            comparison.start = body.start
+            comparison.end = body.end
+            comparison.version += 1
+            session.flush()
+            return _comparison_payload(comparison)
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="比较组合名称已存在") from exc
+
+
+@app.delete("/comparison-sets/{comparison_id}")
+def delete_comparison(comparison_id: int):
+    with SessionLocal.begin() as session:
+        comparison = session.get(ComparisonSet, comparison_id)
+        if comparison is None:
+            raise HTTPException(status_code=404, detail="比较组合不存在")
+        session.delete(comparison)
     return {"success": True}
 
 
@@ -529,7 +770,9 @@ def daily_rows(body: DataRowsBody):
             statement = statement.where(DailyBar.trade_date >= body.start)
         if body.end:
             statement = statement.where(DailyBar.trade_date <= body.end)
-        count = session.scalar(select(func.count()).select_from(statement.subquery())) or 0
+        count = (
+            session.scalar(select(func.count()).select_from(statement.subquery())) or 0
+        )
         bars = session.scalars(
             statement.order_by(DailyBar.trade_date.desc(), DailyBar.symbol)
             .offset(body.offset)

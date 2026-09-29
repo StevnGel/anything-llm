@@ -1,13 +1,16 @@
 """A 股查询、同步和共享业务资产操作。"""
 
 import json
+import logging
 import math
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
-from concurrent.futures import ThreadPoolExecutor
+from zoneinfo import ZoneInfo
 
+import duckdb
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -17,21 +20,27 @@ from .db import SessionLocal, engine
 from .models import (
     DailyBar,
     Security,
-    SecurityNote,
     SecurityTag,
     StockGroup,
     StockGroupItem,
     SyncJob,
     Tag,
-    TagCategory,
     WatchlistItem,
     utc_now,
 )
-from .providers import FuyaoClient, ProviderError, board_for, load_recent_dump, trade_date_from_ms
+from .providers import (
+    FuyaoClient,
+    ProviderError,
+    board_for,
+    load_recent_dump,
+    market_dump,
+    trade_date_from_ms,
+)
 
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ashare-sync")
 SYNC_LOCK = Lock()
 STORAGE_DIR = Path(__file__).resolve().parents[1] / "storage"
+LOGGER = logging.getLogger(__name__)
 
 
 def serialize_security(security: Security) -> dict:
@@ -88,9 +97,14 @@ def data_status() -> dict:
         latest = session.scalar(select(func.max(DailyBar.trade_date)))
         covered = 0
         if latest:
-            covered = session.scalar(
-                select(func.count()).select_from(DailyBar).where(DailyBar.trade_date == latest)
-            ) or 0
+            covered = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(DailyBar)
+                    .where(DailyBar.trade_date == latest)
+                )
+                or 0
+            )
         bars = session.scalar(select(func.count()).select_from(DailyBar)) or 0
         latest_job = session.scalars(
             select(SyncJob).order_by(SyncJob.id.desc()).limit(1)
@@ -114,7 +128,12 @@ def _tag_map(session) -> dict[str, list[dict]]:
         tag = tags.get(link.tag_id)
         if tag:
             result[link.symbol].append(
-                {"id": tag.id, "name": tag.name, "color": tag.color, "category_id": tag.category_id}
+                {
+                    "id": tag.id,
+                    "name": tag.name,
+                    "color": tag.color,
+                    "category_id": tag.category_id,
+                }
             )
     return result
 
@@ -147,20 +166,41 @@ def query_securities(payload: dict) -> dict:
         watchlist = set(session.scalars(select(WatchlistItem.symbol)).all())
         tags = _tag_map(session)
         group = session.get(StockGroup, group_id) if group_id else None
+        if group_id and group is None:
+            raise HTTPException(status_code=404, detail="分组不存在")
         group_members = set()
+        group_query = ""
+        group_board = None
         if group and group.kind == "fixed":
             group_members = set(
                 session.scalars(
-                    select(StockGroupItem.symbol).where(StockGroupItem.group_id == group.id)
+                    select(StockGroupItem.symbol).where(
+                        StockGroupItem.group_id == group.id
+                    )
                 ).all()
             )
+        if group and group.kind == "dynamic":
+            definition = json.loads(group.filter_json or "{}")
+            group_query = str(definition.get("q", "")).strip().casefold()
+            group_board = definition.get("board")
+            if definition.get("scope") == "watchlist" and scope == "all_market":
+                scope = "watchlist"
+            if definition.get("tag_match") == "any":
+                tag_match = "any"
+            include_ids.update(definition.get("include_tag_ids") or [])
+            exclude_ids.update(definition.get("exclude_tag_ids") or [])
 
         rows = []
         for security in securities:
             symbol = security.symbol
-            if q and q not in f"{symbol} {security.code} {security.name}".casefold():
+            search_text = f"{symbol} {security.code} {security.name}".casefold()
+            if q and q not in search_text:
+                continue
+            if group_query and group_query not in search_text:
                 continue
             if board and security.board != board:
+                continue
+            if group_board and security.board != group_board:
                 continue
             if scope == "watchlist" and symbol not in watchlist:
                 continue
@@ -196,7 +236,11 @@ def query_securities(payload: dict) -> dict:
         reverse = sort.get("direction") == "desc"
         rows.sort(key=lambda row: row["symbol"])
         rows.sort(
-            key=lambda row: row[field] if row[field] is not None else ("" if field in {"symbol", "name"} else 0),
+            key=lambda row: (
+                row[field]
+                if row[field] is not None
+                else ("" if field in {"symbol", "name"} else 0)
+            ),
             reverse=reverse,
         )
         # 缺数始终位于末尾；缺失行情不能参与目标日涨跌幅排序。
@@ -219,8 +263,10 @@ def aggregate_bars(bars: list[dict], period: str) -> list[dict]:
     current_key = None
     for bar in bars:
         trade_day = date.fromisoformat(bar["date"])
-        key = (trade_day.isocalendar().year, trade_day.isocalendar().week) if period == "1w" else (
-            trade_day.year, trade_day.month
+        key = (
+            (trade_day.isocalendar().year, trade_day.isocalendar().week)
+            if period == "1w"
+            else (trade_day.year, trade_day.month)
         )
         if key != current_key:
             grouped.append({**bar})
@@ -236,7 +282,9 @@ def aggregate_bars(bars: list[dict], period: str) -> list[dict]:
     previous_close = None
     for bar in grouped:
         bar["change_pct"] = (
-            round((bar["close"] / previous_close - 1) * 100, 3) if previous_close else None
+            round((bar["close"] / previous_close - 1) * 100, 3)
+            if previous_close
+            else None
         )
         previous_close = bar["close"]
     return grouped
@@ -258,7 +306,12 @@ def get_bars(symbol: str, period: str, start: date | None, end: date | None) -> 
             "bars": aggregate_bars([serialize_bar(bar) for bar in bars], period),
             "period": period,
             "adjust": "none",
-            "units": {"price": "CNY", "volume": "shares", "amount": "CNY", "change_pct": "%"},
+            "units": {
+                "price": "CNY",
+                "volume": "shares",
+                "amount": "CNY",
+                "change_pct": "%",
+            },
             "source": "Fuyao",
             "latest_trade_date": bars[-1].trade_date.isoformat() if bars else None,
         }
@@ -268,7 +321,9 @@ def _upsert_rows(session, model, rows: list[dict], key_columns: list[str]) -> No
     if not rows:
         return
     table = model.__table__
-    dialect_insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    dialect_insert = (
+        postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    )
     for index in range(0, len(rows), 500):
         chunk = rows[index : index + 500]
         statement = dialect_insert(table).values(chunk)
@@ -277,18 +332,26 @@ def _upsert_rows(session, model, rows: list[dict], key_columns: list[str]) -> No
             for column in table.columns
             if column.name not in key_columns
         }
-        session.execute(statement.on_conflict_do_update(index_elements=key_columns, set_=updates))
+        session.execute(
+            statement.on_conflict_do_update(index_elements=key_columns, set_=updates)
+        )
 
 
 def _normalize_bar(symbol: str, row: dict, source: str) -> dict:
     date_ms = row.get("date_ms")
-    values = [row.get(key) for key in ("open_price", "high_price", "low_price", "close_price")]
+    values = [
+        row.get(key) for key in ("open_price", "high_price", "low_price", "close_price")
+    ]
     if not isinstance(date_ms, int) or any(value is None for value in values):
         raise ProviderError(f"{symbol} 存在缺失的交易日期或 OHLC")
     open_price, high, low, close = map(float, values)
     if not all(map(math.isfinite, (open_price, high, low, close))):
         raise ProviderError(f"{symbol} 存在非有限价格")
-    if min(open_price, high, low, close) <= 0 or high < max(open_price, close) or low > min(open_price, close):
+    if (
+        min(open_price, high, low, close) <= 0
+        or high < max(open_price, close)
+        or low > min(open_price, close)
+    ):
         raise ProviderError(f"{symbol} 存在无效 OHLC")
     volume = row.get("volume")
     amount = row.get("turnover")
@@ -367,7 +430,11 @@ def _sync_recent(job_id: int) -> None:
     for item in source_rows:
         if item.get("thscode") not in known:
             continue
-        if item.get("currency") != "CNY" or item.get("interval") != "1d" or item.get("adjusted") != "none":
+        if (
+            item.get("currency") != "CNY"
+            or item.get("interval") != "1d"
+            or item.get("adjusted") != "none"
+        ):
             raise ProviderError("Fuyao 日线文件的币种、周期或复权口径不符合要求")
         rows.append(_normalize_bar(item["thscode"], item, "fuyao_recent_dump"))
     if not rows:
@@ -379,6 +446,100 @@ def _sync_recent(job_id: int) -> None:
         job.total = len(rows)
         job.completed = len(rows)
         job.message = f"已发布 {len(rows)} 根近期日线"
+
+
+def _sync_full(job_id: int) -> None:
+    with SessionLocal() as session:
+        known = set(session.scalars(select(Security.symbol)).all())
+    if not known:
+        raise ProviderError("请先同步股票池，再回填全市场历史日线")
+
+    five_year_start = datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(
+        days=365 * 5
+    )
+    start_ms = int(
+        datetime.combine(
+            five_year_start, datetime.min.time(), ZoneInfo("Asia/Shanghai")
+        ).timestamp()
+        * 1000
+    )
+    with market_dump(FuyaoClient(), STORAGE_DIR, "full") as (_source, dump_path):
+        # 排序计算可能落盘，临时文件限定在本次下载目录并随任务清理。
+        connection = duckdb.connect(
+            config={"temp_directory": str(dump_path.parent / "duckdb")}
+        )
+        try:
+            # 先核对目标日期范围的源键，避免冲突行被 upsert 任意覆盖。
+            duplicate = connection.execute(
+                """
+                SELECT thscode, date_ms
+                FROM read_parquet(?)
+                WHERE date_ms >= ?
+                GROUP BY thscode, date_ms
+                HAVING COUNT(*) > 1
+                LIMIT 1
+                """,
+                [str(dump_path), start_ms],
+            ).fetchone()
+            if duplicate:
+                raise ProviderError("Fuyao 全量日线包含重复证券与日期，未继续发布")
+
+            # DuckDB 在文件上计算前收盘价；Arrow 分批交接，避免整库载入 Python 内存。
+            reader = connection.execute(
+                """
+                SELECT
+                    thscode,
+                    date_ms,
+                    currency,
+                    interval,
+                    adjusted,
+                    open_price,
+                    high_price,
+                    low_price,
+                    close_price,
+                    volume,
+                    turnover,
+                    LAG(close_price) OVER (
+                        PARTITION BY thscode ORDER BY date_ms
+                    ) AS previous_close
+                FROM read_parquet(?)
+                WHERE date_ms >= ?
+                ORDER BY thscode, date_ms
+                """,
+                [str(dump_path), start_ms],
+            ).fetch_record_batch(rows_per_batch=5000)
+            for batch in reader:
+                rows = []
+                for item in batch.to_pylist():
+                    symbol = item["thscode"]
+                    if symbol not in known:
+                        continue
+                    if (item["currency"], item["interval"], item["adjusted"]) != (
+                        "CNY",
+                        "1d",
+                        "none",
+                    ):
+                        raise ProviderError(
+                            "Fuyao 全量日线口径不符合未复权 CNY 日线要求"
+                        )
+                    row = _normalize_bar(symbol, item, "fuyao_full_dump")
+                    previous = item["previous_close"]
+                    if previous and previous > 0:
+                        row["change_pct"] = round(
+                            (row["close"] / previous - 1) * 100, 3
+                        )
+                    rows.append(row)
+                with SessionLocal.begin() as session:
+                    _upsert_rows(session, DailyBar, rows, ["symbol", "trade_date"])
+                    job = session.get(SyncJob, job_id)
+                    job.completed += len(rows)
+                    job.updated_at = utc_now()
+        finally:
+            connection.close()
+    with SessionLocal.begin() as session:
+        job = session.get(SyncJob, job_id)
+        job.total = job.completed
+        job.message = f"已发布 {job.completed} 根近 5 年未复权日线"
 
 
 def _sync_history(job_id: int, symbols: list[str]) -> None:
@@ -399,7 +560,15 @@ def _sync_history(job_id: int, symbols: list[str]) -> None:
                 int(start.timestamp() * 1000),
                 int(end.timestamp() * 1000),
             )
-            rows = [_normalize_bar(symbol, row, "fuyao_historical") for row in source_rows]
+            if any(
+                (row.get("currency"), row.get("interval"), row.get("adjusted"))
+                != ("CNY", "1d", "none")
+                for row in source_rows
+            ):
+                raise ProviderError("返回的币种、周期或复权口径不符合要求")
+            rows = [
+                _normalize_bar(symbol, row, "fuyao_historical") for row in source_rows
+            ]
             if not rows:
                 raise ProviderError("未返回日线")
             if len({row["trade_date"] for row in rows}) != len(rows):
@@ -418,7 +587,11 @@ def _sync_history(job_id: int, symbols: list[str]) -> None:
                 job.updated_at = utc_now()
     with SessionLocal.begin() as session:
         job = session.get(SyncJob, job_id)
-        job.message = "；".join(errors[:5]) if errors else f"已回填 {job.completed} 只股票近 5 年日线"
+        job.message = (
+            "；".join(errors[:5])
+            if errors
+            else f"已回填 {job.completed} 只股票近 5 年日线"
+        )
 
 
 def _run_job(job_id: int) -> None:
@@ -434,6 +607,8 @@ def _run_job(job_id: int) -> None:
                 _sync_universe(job_id)
             elif dataset == "recent":
                 _sync_recent(job_id)
+            elif dataset == "full":
+                _sync_full(job_id)
             else:
                 _sync_history(job_id, symbols)
             with SessionLocal.begin() as session:
@@ -443,13 +618,20 @@ def _run_job(job_id: int) -> None:
         except (ProviderError, ValueError, OSError) as exc:
             with SessionLocal.begin() as session:
                 job = session.get(SyncJob, job_id)
-                job.status = "failed"
+                job.status = "partial" if job.completed else "failed"
                 job.message = str(exc)
+                job.updated_at = utc_now()
+        except Exception as exc:
+            LOGGER.exception("A 股同步任务 %s 失败：%s", job_id, type(exc).__name__)
+            with SessionLocal.begin() as session:
+                job = session.get(SyncJob, job_id)
+                job.status = "partial" if job.completed else "failed"
+                job.message = "内部同步失败，请检查服务日志并重新提交"
                 job.updated_at = utc_now()
 
 
 def create_sync_job(dataset: str, symbols: list[str]) -> dict:
-    if dataset not in {"universe", "recent", "history"}:
+    if dataset not in {"universe", "recent", "full", "history"}:
         raise HTTPException(status_code=422, detail="不支持的同步数据集")
     if dataset == "history" and (not symbols or len(symbols) > 20):
         raise HTTPException(status_code=422, detail="一次只能回填 1 至 20 只股票")
@@ -458,8 +640,12 @@ def create_sync_job(dataset: str, symbols: list[str]) -> dict:
             select(SyncJob).where(SyncJob.status.in_(["queued", "running"])).limit(1)
         ).first()
         if active:
-            raise HTTPException(status_code=409, detail=f"同步任务 {active.id} 正在执行")
-        job = SyncJob(dataset=dataset, targets_json=json.dumps(symbols), total=len(symbols))
+            raise HTTPException(
+                status_code=409, detail=f"同步任务 {active.id} 正在执行"
+            )
+        job = SyncJob(
+            dataset=dataset, targets_json=json.dumps(symbols), total=len(symbols)
+        )
         session.add(job)
         session.flush()
         result = serialize_job(job)

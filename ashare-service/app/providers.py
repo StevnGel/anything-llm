@@ -2,12 +2,13 @@
 
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import pyarrow.parquet as parquet
 import requests
+from pyarrow import parquet
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 FUYAO_BASE_URL = "https://fuyao.aicubes.cn"
@@ -106,11 +107,17 @@ class FuyaoClient:
             },
         ).get("item", [])
 
-    def recent_dump(self, destination: Path) -> Path:
-        data = self.get("/api/dump/market-dumps/daily-k-10d/download-url")
+    def download_dump(self, kind: str, destination: Path) -> Path:
+        endpoints = {
+            "recent": "/api/dump/market-dumps/daily-k-10d/download-url",
+            "full": "/api/dump/market-dumps/daily-k/download-url",
+        }
+        if kind not in endpoints:
+            raise ValueError("不支持的 Fuyao 日线文件类型")
+        data = self.get(endpoints[kind])
         url = data.get("presigned_url")
         if not isinstance(url, str) or not url.startswith("https://"):
-            raise ProviderError("Fuyao 未返回有效的近期日线下载地址")
+            raise ProviderError("Fuyao 未返回有效的日线下载地址")
 
         # 预签名 URL 只在内存中使用，不写入文件名、数据库或错误日志。
         try:
@@ -120,19 +127,25 @@ class FuyaoClient:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
                         output.write(chunk)
         except requests.RequestException as exc:
-            raise ProviderError("Fuyao 近期日线下载失败，请重新发起同步") from exc
+            raise ProviderError("Fuyao 日线下载失败，请重新发起同步") from exc
         return destination
 
 
-def load_recent_dump(client: FuyaoClient, storage_dir: Path) -> list[dict]:
-    """下载文件仅在一次同步中使用，退出临时目录时清除。"""
+@contextmanager
+def market_dump(client: FuyaoClient, storage_dir: Path, kind: str):
+    """下载文件只在本次同步中可见，结束时清除临时文件及签名链接。"""
     storage_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="fuyao-", dir=storage_dir) as temp_dir:
-        dump_path = client.recent_dump(Path(temp_dir) / "daily.parquet")
+        dump_path = client.download_dump(kind, Path(temp_dir) / "daily.parquet")
         source = parquet.ParquetFile(dump_path)
         if not DAILY_COLUMNS.issubset(source.schema.names):
             raise ProviderError("Fuyao 日线文件字段与已验证契约不符")
+        yield source, dump_path
 
+
+def load_recent_dump(client: FuyaoClient, storage_dir: Path) -> list[dict]:
+    """近期文件规模较小，先完整核对源键，再交给调用方发布。"""
+    with market_dump(client, storage_dir, "recent") as (source, _dump_path):
         rows = []
         seen = set()
         for batch in source.iter_batches(batch_size=5000):
