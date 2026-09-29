@@ -3,6 +3,7 @@ v-env
 !.env.example
 
 node_modules
+tmp/
 __pycache__
 v-env
 .DS_Store

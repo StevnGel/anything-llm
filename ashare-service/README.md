@@ -6,18 +6,21 @@ AnythingLLM 的 `/api/ashares` 路由负责用户鉴权；本服务仅接受内�
 
 ## 本地启动
 
-需要 Python 3.12。先在工作区根目录建立虚拟环境并安装依赖：
+需要 Python 3.12 和 `uv`。先在 `anything-llm/ashare-service/` 目录创建 `.venv`
+并安装依赖：
 
 ```bash
-python3 -m venv ./tmp/ashare-dev/venv
-./tmp/ashare-dev/venv/bin/pip install -r ./anything-llm/ashare-service/requirements.txt
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
 在运行环境中设置 `FUYAO_API_KEY` 和随机生成的 `ASHARE_SERVICE_TOKEN`，然后从
 `anything-llm/ashare-service/` 启动：
 
 ```bash
-../../tmp/ashare-dev/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8765
+.venv/bin/python -m uvicorn app.main:app \
+  --host 127.0.0.1 \
+  --port 8765
 ```
 
 AnythingLLM 服务端使用相同的 `ASHARE_SERVICE_TOKEN`，并设置
